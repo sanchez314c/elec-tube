@@ -1,0 +1,308 @@
+import { app, BrowserWindow, ipcMain, shell } from 'electron';
+import * as path from 'path';
+import { spawn } from 'child_process';
+import Store from 'electron-store';
+import { YouTubeAPI } from './youtube-api';
+import { YouTubeOAuth } from './oauth';
+
+// ── Platform-specific Chromium flags ──
+// Must be set BEFORE app.ready — works in source AND packaged builds.
+if (process.platform === 'linux') {
+  // Required for transparent BrowserWindow on Linux compositors (X11/Wayland)
+  app.commandLine.appendSwitch('enable-transparent-visuals');
+  // Prevents transparency artifacts on some Linux DEs without disabling full GPU
+  app.commandLine.appendSwitch('disable-gpu-compositing');
+  // Electron sandbox fix — prevents "credentials.cc: Permission denied" crash on Linux
+  app.commandLine.appendSwitch('no-sandbox');
+  app.commandLine.appendSwitch('disable-gpu-sandbox');
+}
+
+const store = new Store();
+const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged;
+
+let mainWindow: BrowserWindow | null = null;
+let youtubeAPI: YouTubeAPI;
+let youtubeOAuth: YouTubeOAuth;
+
+async function refreshTokenIfNeeded(): Promise<void> {
+  if (youtubeOAuth.isLoggedIn()) {
+    const accessToken = await youtubeOAuth.getValidAccessToken();
+    if (accessToken) {
+      youtubeAPI.setAccessToken(accessToken);
+    }
+  }
+}
+
+function createWindow(): void {
+  const isMac = process.platform === 'darwin';
+  mainWindow = new BrowserWindow({
+    width: 1600,
+    height: 1846,
+    minWidth: 1024,
+    minHeight: 600,
+    frame: false,
+    transparent: true,
+    backgroundColor: '#00000000',
+    hasShadow: false,
+    resizable: true,
+    roundedCorners: true,
+    ...(isMac ? { titleBarStyle: 'hiddenInset' } : {}),
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+      preload: path.join(__dirname, 'preload.js'),
+      sandbox: false,
+    },
+    show: false,
+  });
+
+  mainWindow.once('ready-to-show', () => {
+    mainWindow?.show();
+  });
+
+  if (isDev) {
+    mainWindow.loadURL('http://localhost:50826');
+    // DevTools available via Ctrl+Shift+I (manual open only)
+  } else {
+    mainWindow.loadFile(path.join(__dirname, '../renderer/index.html'));
+  }
+
+  mainWindow.on('closed', () => {
+    mainWindow = null;
+  });
+}
+
+app.whenReady().then(async () => {
+  const apiKey = process.env.YOUTUBE_API_KEY;
+  if (!apiKey) {
+    console.error('YOUTUBE_API_KEY not found in environment variables');
+  }
+  youtubeAPI = new YouTubeAPI(apiKey || '');
+  youtubeOAuth = new YouTubeOAuth();
+
+  // If user is logged in, set the access token for authenticated API calls
+  if (youtubeOAuth.isLoggedIn()) {
+    const accessToken = await youtubeOAuth.getValidAccessToken();
+    if (accessToken) {
+      youtubeAPI.setAccessToken(accessToken);
+    }
+  }
+
+  createWindow();
+
+  app.on('activate', () => {
+    if (BrowserWindow.getAllWindows().length === 0) {
+      createWindow();
+    }
+  });
+});
+
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') {
+    app.quit();
+  }
+});
+
+// Window controls
+ipcMain.handle('window:minimize', () => mainWindow?.minimize());
+ipcMain.handle('window:maximize', () => {
+  if (mainWindow?.isMaximized()) {
+    mainWindow.unmaximize();
+  } else {
+    mainWindow?.maximize();
+  }
+});
+ipcMain.handle('window:close', () => mainWindow?.close());
+
+// ===== OAuth Handlers =====
+ipcMain.handle('auth:login', async () => {
+  try {
+    const tokens = await youtubeOAuth.authenticate();
+    if (tokens?.accessToken) {
+      youtubeAPI.setAccessToken(tokens.accessToken);
+    }
+    return { success: true };
+  } catch (error) {
+    console.error('Login failed:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('auth:logout', () => {
+  youtubeOAuth.logout();
+  // Reset API to use only API key
+  const apiKey = process.env.YOUTUBE_API_KEY || '';
+  youtubeAPI = new YouTubeAPI(apiKey);
+  return { success: true };
+});
+
+ipcMain.handle('auth:getProfile', async () => {
+  try {
+    return await youtubeOAuth.getUserProfile();
+  } catch (error) {
+    console.error('Failed to get profile:', error);
+    return null;
+  }
+});
+
+ipcMain.handle('auth:isLoggedIn', () => {
+  return youtubeOAuth.isLoggedIn();
+});
+
+ipcMain.handle('auth:isConfigured', () => {
+  return youtubeOAuth.isConfigured();
+});
+
+// YouTube API handlers
+ipcMain.handle('youtube:getPlaylists', async () => {
+  try {
+    await refreshTokenIfNeeded();
+    return await youtubeAPI.getMyPlaylists();
+  } catch (error) {
+    console.error('Failed to fetch playlists:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('youtube:getPlaylistItems', async (_, playlistId: string) => {
+  try {
+    return await youtubeAPI.getPlaylistItems(playlistId);
+  } catch (error) {
+    console.error('Failed to fetch playlist items:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('youtube:search', async (_, query: string) => {
+  try {
+    return await youtubeAPI.search(query);
+  } catch (error) {
+    console.error('Search failed:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('youtube:getVideoDetails', async (_, videoId: string) => {
+  try {
+    return await youtubeAPI.getVideoDetails(videoId);
+  } catch (error) {
+    console.error('Failed to get video details:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('youtube:getTrending', async (_, pageToken?: string) => {
+  try {
+    return await youtubeAPI.getTrendingVideosPaginated('US', pageToken);
+  } catch (error) {
+    console.error('Failed to fetch trending:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('youtube:getSubscriptions', async () => {
+  try {
+    await refreshTokenIfNeeded();
+    return await youtubeAPI.getSubscriptions();
+  } catch (error) {
+    console.error('Failed to fetch subscriptions:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('youtube:getSubscriptionFeed', async (_, pageToken?: string) => {
+  try {
+    await refreshTokenIfNeeded();
+    return await youtubeAPI.getSubscriptionFeed(pageToken);
+  } catch (error) {
+    console.error('Failed to fetch subscription feed:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('youtube:getLikedVideos', async (_, pageToken?: string) => {
+  try {
+    await refreshTokenIfNeeded();
+    return await youtubeAPI.getLikedVideos(pageToken);
+  } catch (error) {
+    console.error('Failed to fetch liked videos:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('youtube:getWatchHistory', async (_, pageToken?: string) => {
+  try {
+    await refreshTokenIfNeeded();
+    return await youtubeAPI.getWatchHistory(pageToken);
+  } catch (error) {
+    console.error('Failed to fetch watch history:', error);
+    throw error;
+  }
+});
+
+// Get binary paths - prefer self-contained, fallback to system
+function getBinaryPaths() {
+  const appRoot = app.isPackaged
+    ? path.dirname(app.getPath('exe'))
+    : path.join(__dirname, '../..');
+
+  const mpvPath = process.env.ELECTUBE_MPV_PATH || path.join(appRoot, 'bin', 'mpv.AppImage');
+  const ytdlpPath = process.env.ELECTUBE_YTDLP_PATH || path.join(appRoot, 'bin', 'yt-dlp');
+
+  return { mpvPath, ytdlpPath };
+}
+
+// Play video with yt-dlp + mpv
+ipcMain.handle('player:play', async (_, videoId: string) => {
+  if (!/^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
+    throw new Error('Invalid video ID format');
+  }
+  const url = `https://www.youtube.com/watch?v=${videoId}`;
+  const { mpvPath, ytdlpPath } = getBinaryPaths();
+
+  try {
+    const mpv = spawn(mpvPath, [
+      `--ytdl-format=bestvideo[height<=?1080]+bestaudio/best`,
+      `--script-opts=ytdl_hook-ytdl_path=${ytdlpPath}`,
+      '--force-window=immediate',
+      '--ontop',
+      '--no-terminal',
+      url
+    ], {
+      detached: true,
+      stdio: 'ignore'
+    });
+
+    mpv.on('error', (err) => {
+      console.error('Failed to spawn mpv:', err);
+    });
+    mpv.unref();
+    return { success: true };
+  } catch (error) {
+    console.error('Failed to launch mpv:', error);
+    throw error;
+  }
+});
+
+// Open in browser fallback
+ipcMain.handle('player:openInBrowser', async (_, videoId: string) => {
+  if (!/^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
+    throw new Error('Invalid video ID format');
+  }
+  const url = `https://www.youtube.com/watch?v=${videoId}`;
+  await shell.openExternal(url);
+  return { success: true };
+});
+
+// Open external URL with protocol validation
+ipcMain.handle('open-external', async (_, url: string) => {
+  const parsed = new URL(url);
+  if (['http:', 'https:', 'mailto:'].includes(parsed.protocol)) {
+    await shell.openExternal(url);
+  }
+});
+
+// Store handlers for caching
+ipcMain.handle('store:get', (_, key: string) => store.get(key));
+ipcMain.handle('store:set', (_, key: string, value: unknown) => store.set(key, value));
+ipcMain.handle('store:delete', (_, key: string) => store.delete(key));

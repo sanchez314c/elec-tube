@@ -1,0 +1,310 @@
+import { BrowserWindow, session } from 'electron';
+import { google } from 'googleapis';
+import Store from 'electron-store';
+import * as http from 'http';
+import * as net from 'net';
+
+const store = new Store();
+
+const SCOPES = [
+  'https://www.googleapis.com/auth/youtube.readonly',
+  'https://www.googleapis.com/auth/youtube',
+  'https://www.googleapis.com/auth/userinfo.profile',
+  'https://www.googleapis.com/auth/userinfo.email',
+];
+
+export interface UserProfile {
+  id: string;
+  email: string;
+  name: string;
+  picture: string;
+}
+
+export interface AuthTokens {
+  accessToken: string;
+  refreshToken: string;
+  expiryDate: number;
+}
+
+// Find an available port
+async function findAvailablePort(startPort: number): Promise<number> {
+  return new Promise((resolve) => {
+    const server = net.createServer();
+    server.listen(startPort, () => {
+      const port = (server.address() as net.AddressInfo).port;
+      server.close(() => resolve(port));
+    });
+    server.on('error', () => {
+      resolve(findAvailablePort(startPort + 1));
+    });
+  });
+}
+
+export class YouTubeOAuth {
+  private oauth2Client;
+  private clientId: string;
+  private clientSecret: string;
+  private activeServer: http.Server | null = null;
+  private isAuthenticating: boolean = false;
+
+  constructor() {
+    this.clientId = process.env.YOUTUBE_CLIENT_ID || '';
+    this.clientSecret = process.env.YOUTUBE_CLIENT_SECRET || '';
+
+    // Will be updated with actual port during auth
+    this.oauth2Client = new google.auth.OAuth2(
+      this.clientId,
+      this.clientSecret,
+      'http://localhost:8901/oauth2callback'
+    );
+  }
+
+  isConfigured(): boolean {
+    return !!(this.clientId && this.clientSecret);
+  }
+
+  private cleanup(): void {
+    if (this.activeServer) {
+      try {
+        this.activeServer.close();
+      } catch (e) {
+        // Ignore cleanup errors
+      }
+      this.activeServer = null;
+    }
+  }
+
+  async authenticate(): Promise<AuthTokens | null> {
+    // Prevent duplicate auth attempts
+    if (this.isAuthenticating) {
+      console.log('Authentication already in progress, skipping duplicate request');
+      return null;
+    }
+
+    this.isAuthenticating = true;
+
+    // Clean up any previous server
+    this.cleanup();
+
+    if (!this.isConfigured()) {
+      this.isAuthenticating = false;
+      throw new Error('OAuth not configured. Set YOUTUBE_CLIENT_ID and YOUTUBE_CLIENT_SECRET in your environment.');
+    }
+
+    // Find available port
+    const port = await findAvailablePort(8901);
+    console.log(`OAuth using port ${port}`);
+
+    // Update OAuth client with correct redirect URI
+    this.oauth2Client = new google.auth.OAuth2(
+      this.clientId,
+      this.clientSecret,
+      `http://localhost:${port}/oauth2callback`
+    );
+
+    const authUrl = this.oauth2Client.generateAuthUrl({
+      access_type: 'offline',
+      scope: SCOPES,
+      prompt: 'consent',
+    });
+
+    console.log('Generated auth URL:', authUrl.substring(0, 100) + '...');
+
+    return new Promise((resolve, reject) => {
+      const authWindow = new BrowserWindow({
+        width: 600,
+        height: 700,
+        show: false,
+        alwaysOnTop: true,
+        webPreferences: {
+          nodeIntegration: false,
+          contextIsolation: true,
+        },
+      });
+
+      const server = http.createServer(async (req, res) => {
+        const url = new URL(req.url || '', `http://localhost:${port}`);
+
+        if (url.pathname === '/oauth2callback') {
+          const code = url.searchParams.get('code');
+
+          if (code) {
+            try {
+              const { tokens } = await this.oauth2Client.getToken(code);
+              this.oauth2Client.setCredentials(tokens);
+
+              const authTokens: AuthTokens = {
+                accessToken: tokens.access_token || '',
+                refreshToken: tokens.refresh_token || '',
+                expiryDate: tokens.expiry_date || 0,
+              };
+
+              store.set('authTokens', authTokens);
+
+              res.writeHead(200, { 'Content-Type': 'text/html' });
+              res.end(`
+                <html>
+                  <body style="background: #0f0f0f; color: #f1f1f1; font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0;">
+                    <div style="text-align: center;">
+                      <h1 style="color: #ff0000;">Authentication Successful!</h1>
+                      <p>You can close this window now.</p>
+                      <script>setTimeout(() => window.close(), 1500);</script>
+                    </div>
+                  </body>
+                </html>
+              `);
+
+              clearTimeout(authTimeout);
+              this.isAuthenticating = false;
+              this.cleanup();
+              authWindow.close();
+              resolve(authTokens);
+            } catch (error) {
+              res.writeHead(500, { 'Content-Type': 'text/html' });
+              res.end('<html><body style="background:#0f0f0f;color:#f1f1f1;padding:20px;">Authentication failed. Please close this window and try again.</body></html>');
+              clearTimeout(authTimeout);
+              this.isAuthenticating = false;
+              this.cleanup();
+              authWindow.close();
+              reject(error);
+            }
+          } else {
+            res.writeHead(400, { 'Content-Type': 'text/html' });
+            res.end('<html><body>No authorization code received</body></html>');
+          }
+        }
+      });
+
+      this.activeServer = server;
+
+      server.on('error', (err) => {
+        console.error('OAuth server error:', err);
+        clearTimeout(authTimeout);
+        this.isAuthenticating = false;
+        this.cleanup();
+        authWindow.close();
+        reject(err);
+      });
+
+      server.listen(port, () => {
+        console.log(`OAuth callback server listening on port ${port}`);
+        console.log('Loading Google auth URL in window...');
+
+        authWindow.loadURL(authUrl);
+
+        authWindow.webContents.on('did-finish-load', () => {
+          console.log('Auth window finished loading, showing window');
+          authWindow.show();
+          authWindow.focus();
+        });
+
+        authWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription) => {
+          console.error('Auth window failed to load:', errorCode, errorDescription);
+          clearTimeout(authTimeout);
+          this.isAuthenticating = false;
+          this.cleanup();
+          authWindow.close();
+          reject(new Error(`Failed to load auth page: ${errorDescription}`));
+        });
+      });
+
+      // Auto-close auth after 5 minutes
+      const authTimeout = setTimeout(() => {
+        this.isAuthenticating = false;
+        this.cleanup();
+        authWindow.close();
+        reject(new Error('Authentication timed out after 5 minutes'));
+      }, 300000);
+
+      authWindow.on('closed', () => {
+        clearTimeout(authTimeout);
+        this.isAuthenticating = false;
+        this.cleanup();
+      });
+    });
+  }
+
+  async getUserProfile(): Promise<UserProfile | null> {
+    const tokens = store.get('authTokens') as AuthTokens | undefined;
+
+    if (!tokens?.accessToken) {
+      return null;
+    }
+
+    this.oauth2Client.setCredentials({
+      access_token: tokens.accessToken,
+      refresh_token: tokens.refreshToken,
+    });
+
+    try {
+      const oauth2 = google.oauth2({ version: 'v2', auth: this.oauth2Client });
+      const { data } = await oauth2.userinfo.get();
+
+      return {
+        id: data.id || '',
+        email: data.email || '',
+        name: data.name || '',
+        picture: data.picture || '',
+      };
+    } catch (error) {
+      console.error('Failed to get user profile:', error);
+      return null;
+    }
+  }
+
+  async getValidAccessToken(): Promise<string | null> {
+    const tokens = store.get('authTokens') as AuthTokens | undefined;
+
+    if (!tokens) {
+      return null;
+    }
+
+    if (tokens.expiryDate && Date.now() > tokens.expiryDate - 300000) {
+      try {
+        this.oauth2Client.setCredentials({
+          refresh_token: tokens.refreshToken,
+        });
+
+        const { credentials } = await this.oauth2Client.refreshAccessToken();
+
+        const newTokens: AuthTokens = {
+          accessToken: credentials.access_token || '',
+          refreshToken: tokens.refreshToken,
+          expiryDate: credentials.expiry_date || 0,
+        };
+
+        store.set('authTokens', newTokens);
+        return newTokens.accessToken;
+      } catch (error) {
+        console.error('Failed to refresh token:', error);
+        return null;
+      }
+    }
+
+    return tokens.accessToken;
+  }
+
+  logout(): void {
+    this.cleanup();
+    store.delete('authTokens');
+    session.defaultSession.clearStorageData({
+      storages: ['cookies'],
+    });
+  }
+
+  isLoggedIn(): boolean {
+    const tokens = store.get('authTokens') as AuthTokens | undefined;
+    return !!(tokens?.accessToken);
+  }
+
+  getOAuth2Client() {
+    const tokens = store.get('authTokens') as AuthTokens | undefined;
+    if (tokens?.accessToken) {
+      this.oauth2Client.setCredentials({
+        access_token: tokens.accessToken,
+        refresh_token: tokens.refreshToken,
+      });
+    }
+    return this.oauth2Client;
+  }
+}
